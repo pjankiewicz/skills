@@ -9,7 +9,7 @@ Agent Skills published by [@pjankiewicz](https://github.com/pjankiewicz). Drop-i
 A skill for [`@jackchen_me/open-multi-agent`](https://github.com/JackChen-me/open-multi-agent) — the TypeScript-native multi-agent orchestration framework that turns a goal into a task DAG. Teaches the agent which of the three execution modes to pick (`runAgent` / `runTeam` / `runTasks`), which built-in tools to attach, how to wire MCP servers, how to use Zod-validated structured output, how to mix providers in one team, and which production controls actually matter.
 
 ```bash
-npx skills add pjankiewicz/skills/open-multi-agent
+npx skills add pjankiewicz/skills@open-multi-agent
 ```
 
 To install every skill in this repo at once:
