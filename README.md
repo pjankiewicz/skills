@@ -33,15 +33,29 @@ Browse the directory at [skills.sh](https://skills.sh).
 
 Skills are read on demand by the agent — they do not run code, install dependencies, or modify your project.
 
+## Tools shipped alongside
+
+### `agent-farm/`
+
+A small, generic live dashboard for multi-agent runs. Watches a runs directory and renders any agent activity that follows the [agent-farm event format](./agent-farm/EVENTS.md). Intentionally domain-agnostic — anything that emits well-formed JSONL with a `taskId` shows up. Pairs well with the `open-multi-agent` skill but doesn't depend on it.
+
+See [`agent-farm/README.md`](./agent-farm/README.md) for usage. Install / run from the repo:
+
+```bash
+cd agent-farm && npm install && npm run dev
+# dashboard at http://localhost:5180/, watching ./agent-runs/ by default
+```
+
 ## Layout
 
 ```
 skills/
   <skill-name>/
-    SKILL.md
+    SKILL.md           # the skill itself
+agent-farm/             # optional sidekick dashboard for multi-agent runs
 ```
 
-Standard `npx skills` / [skills.sh](https://skills.sh) layout — one directory per skill, each with a `SKILL.md` carrying YAML frontmatter (`name`, `description`).
+Standard `npx skills` / [skills.sh](https://skills.sh) skill layout — one directory per skill under `skills/`, each with a `SKILL.md` carrying YAML frontmatter (`name`, `description`).
 
 ## Compatibility
 

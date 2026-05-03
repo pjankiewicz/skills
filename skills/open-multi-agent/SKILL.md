@@ -49,128 +49,68 @@ A fourth primitive — `AgentPool` — sits below all three modes. It is what `r
 
 ## Recipes
 
-### Recipe 1 — Triage GitHub issues, fan out one worker per issue into its own git worktree
+### Recipe 1 — Fan out one worker per item (the "agent farm" pattern)
 
-The canonical "agent farm" pattern. Phase A: a triage agent reads open issues and emits a Zod-validated list of solvable ones. Phase B: deterministic driver code creates one git worktree + branch per solvable issue (do **not** delegate filesystem state changes to the LLM — keep this auditable). Phase C: one ephemeral worker agent per worktree runs in parallel under an `AgentPool` concurrency cap. Phase D: branches are pushed; failed worktrees are kept for inspection.
+Whenever you have a list of items (GitHub issues, files, URLs, dataset rows, log entries), the same four-phase shape applies. Items, sandbox, workers, gather. Keep filesystem and remote-state mutations in deterministic driver code; only LLM reasoning happens inside agents.
 
 ```ts
 import {
-  OpenMultiAgent, Agent, AgentPool,
+  Agent, AgentPool,
   ToolRegistry, ToolExecutor, registerBuiltInTools,
 } from '@jackchen_me/open-multi-agent'
 import type { AgentConfig } from '@jackchen_me/open-multi-agent'
-import { z } from 'zod'
-import { execSync } from 'node:child_process'
 
-// --- Provider config (local gemma via Ollama; swap for Anthropic/etc. as needed) ---
-const OLLAMA = { provider: 'openai', baseURL: 'http://localhost:11434/v1', apiKey: 'ollama' } as const
-const MODEL = 'gemma3:12b'   // 4b minimum for reliable tool calls; bigger is steadier
+// A) Produce the item list — either deterministic (read a directory, fetch a feed)
+//    or LLM-mediated with `runAgent` + `outputSchema` for Zod-validated triage.
 
-const orchestrator = new OpenMultiAgent({
-  defaultModel: MODEL, defaultProvider: OLLAMA.provider,
-  defaultBaseURL: OLLAMA.baseURL, defaultApiKey: OLLAMA.apiKey,
-  onProgress: (e) => console.log(e.type, e.agent ?? e.task ?? ''),
-})
+// B) Provision per-item sandboxes in driver code (git worktree, tmpdir, container, …).
+//    Don't ask the LLM to do this — keep the audit trail in TypeScript.
 
-// --- Phase A: triage with structured output --------------------------------
-const TriagePlan = z.object({
-  solvable: z.array(z.object({
-    number: z.number(),
-    title: z.string(),
-    plan: z.string().describe('1–3 line plan for fixing it in one branch'),
-    riskNotes: z.string().optional(),
-  })),
-  skipped: z.array(z.object({ number: z.number(), reason: z.string() })),
-})
-
-const triage: AgentConfig = {
-  name: 'triage', model: MODEL, ...OLLAMA,
-  systemPrompt:
-    'You are a triage agent. Use `gh issue list/view` (via bash) to read open issues. ' +
-    'For each, decide whether it can be fixed by editing a small set of files in one ' +
-    'isolated branch. Be conservative — prefer skipping ambiguous issues. Output JSON.',
-  tools: ['bash'],
-  outputSchema: TriagePlan,
-  maxTurns: 10,
-  loopDetection: { maxRepetitions: 3, onLoopDetected: 'terminate' },
-}
-
-const triageRun = await orchestrator.runAgent(
-  triage,
-  'Run `gh issue list --state open --limit 20 --json number,title,labels,body`. ' +
-  'For each, fetch full body if needed via `gh issue view <n>`. Return the schema.',
-)
-const plan = triageRun.structured as z.infer<typeof TriagePlan> | undefined
-if (!plan) throw new Error(`triage failed: ${triageRun.output.slice(0, 200)}`)
-
-// --- Phase B: provision worktrees deterministically ------------------------
-const REPO = process.cwd()
-const ROOT = '/tmp/agent-wt'
-execSync(`mkdir -p ${ROOT}`)
-
-type Job = { number: number; title: string; plan: string; branch: string; path: string }
-const jobs: Job[] = plan.solvable.map(i => {
-  const branch = `agent/issue-${i.number}`
-  const path = `${ROOT}/issue-${i.number}`
-  // -B replaces an existing branch; --force handles a stale worktree directory
-  execSync(`git -C "${REPO}" worktree add --force -B ${branch} "${path}" HEAD`, { stdio: 'inherit' })
-  return { number: i.number, title: i.title, plan: i.plan, branch, path }
-})
-
-// --- Phase C: build one ephemeral worker per job, fan out via the pool ----
-function buildWorker(job: Job): Agent {
+// C) Build one ephemeral Agent per item and fan out under a concurrency cap.
+function buildWorker(item: Item): Agent {
   const cfg: AgentConfig = {
-    name: `worker-${job.number}`,
-    model: MODEL, ...OLLAMA,
+    name: `worker-${item.id}`,        // unique per item; ephemeral, not pool-registered
+    model: MODEL, ...PROVIDER,
     systemPrompt:
-      `You work ONLY inside ${job.path}. Always pass cwd=${job.path} to the bash tool. ` +
-      `Use absolute paths for file_read/file_write/file_edit. ` +
-      `When changes look right, run \`git -C ${job.path} add -A && git -C ${job.path} commit -m "fix(#${job.number}): <one-line>"\`. ` +
-      `Do not push; the driver will. Stop with a one-paragraph summary.`,
+      `Work ONLY inside ${item.sandbox}. Pass cwd=${item.sandbox} on every bash call. ` +
+      `Make the smallest change that resolves the task. Commit when done; do not push.`,
     tools: ['bash', 'file_read', 'file_write', 'file_edit', 'grep', 'glob'],
     maxTurns: 30,
-    timeoutMs: 10 * 60_000,                                  // wall-clock cap per worker
-    maxTokenBudget: 200_000,                                 // cumulative input+output cap
+    timeoutMs: 10 * 60_000,
+    maxTokenBudget: 200_000,
     loopDetection: { maxRepetitions: 4, onLoopDetected: 'terminate' },
-    compressToolResults: { minChars: 800 },                  // keep context lean across turns
+    compressToolResults: { minChars: 800 },
   }
-  const reg = new ToolRegistry()
-  registerBuiltInTools(reg)
+  const reg = new ToolRegistry(); registerBuiltInTools(reg)
   return new Agent(cfg, reg, new ToolExecutor(reg))
 }
 
-const pool = new AgentPool(2)        // see Pitfalls: real Ollama parallelism needs OLLAMA_NUM_PARALLEL
-
+const pool = new AgentPool(CONCURRENCY)
 const settled = await Promise.allSettled(
-  jobs.map(job => pool.runEphemeral(
-    buildWorker(job),
-    `Resolve issue #${job.number}: ${job.title}\n\nPlan:\n${job.plan}\n\nWorktree: ${job.path}`,
-  )),
+  items.map(item => pool.runEphemeral(buildWorker(item), buildPrompt(item))),
 )
 
-// --- Phase D: push successful branches; keep failed worktrees for triage --
-for (const [i, r] of settled.entries()) {
-  const job = jobs[i]!
-  if (r.status === 'fulfilled' && r.value.success) {
-    execSync(`git -C "${job.path}" push -u origin ${job.branch}`, { stdio: 'inherit' })
-    console.log(`#${job.number} → ${job.branch} pushed (${r.value.tokenUsage.output_tokens} out tokens)`)
-  } else {
-    const why = r.status === 'rejected' ? r.reason : r.value.output.slice(0, 200)
-    console.warn(`#${job.number} kept at ${job.path}: ${why}`)
-  }
-}
-// Cleanup pattern (run after merging): `git -C $REPO worktree remove $path && git branch -D $branch`
+// D) Gather: inspect successes, push/cleanup based on policy. One failure must not
+//    kill the batch — `Promise.allSettled` is the point.
 ```
 
-Anatomy worth noting:
-- **Triage stays inside the framework.** `outputSchema` + `runAgent` gives one validated retry on JSON-parse failure; you get either a typed plan or a clear failure to abort on.
-- **Worktree provisioning is deterministic driver code.** Git plumbing in the LLM's hands is a foot-gun — keep it in TypeScript where you can read the diff and roll back.
-- **Workers are ephemeral.** Each one is a fresh `Agent` instance constructed at fan-out time, so they don't need pool registration and can have unique names without collision. `runEphemeral` skips the per-agent mutex `run`/`runParallel` would impose.
-- **Sandboxing via systemPrompt + cwd parameter.** OMA has no per-agent `cwd` field; you bake the path into the systemPrompt and instruct the agent to pass `cwd` on every bash call. The bash tool honours `cwd` from the LLM's input args.
-- **`Promise.allSettled` is on purpose.** A single worker crashing must not kill the batch — every issue is independent.
-- **Per-worker controls.** `timeoutMs`, `maxTokenBudget`, `loopDetection`, and `compressToolResults` are the four knobs that keep an autonomous worker from burning the house down on a misread issue.
+**Anatomy that's load-bearing across every variant:**
 
-To open PRs after pushing, either chain a second pass with a small writer agent (Zod-validated `{title, body}` per issue → `gh pr create`) or do it deterministically with `gh` in the driver — same trade-off as worktree provisioning.
+- **Triage stays in the framework if you need it.** `outputSchema` (Zod) on a `runAgent` call gives one validated retry on JSON-parse failure; you get either a typed plan or a clear failure to abort on.
+- **Sandboxing belongs to the driver.** Worktrees, tmpdirs, ephemeral containers — provisioned by deterministic TS, never delegated to the LLM. Same for `git push`, `gh pr create`, network calls with side-effects.
+- **Workers are ephemeral.** A fresh `Agent` instance per item, run via `runEphemeral`. They aren't registered, can have unique names without collision, and `runEphemeral` skips the per-agent mutex that `run`/`runParallel` would impose.
+- **Sandboxing inside the worker is a systemPrompt + bash-arg pattern.** OMA has no per-agent `cwd` field. Bake the absolute path into the systemPrompt and instruct the agent to pass `cwd` on every bash call. The `bash` tool reads `cwd` from the LLM's tool-call arguments.
+- **`Promise.allSettled` is intentional.** Independent items must fail independently.
+- **The four production knobs every worker needs:** `timeoutMs`, `maxTokenBudget`, `loopDetection`, `compressToolResults`. Without these, one misread item can burn the batch's wall clock or token budget.
+
+**Live observability — optional sidekick.** Mid-run progress isn't surfaced by OMA's `onProgress`/`onTrace` for ephemeral runs (those wire up at the orchestrator level). The pattern that works:
+
+1. Driver emits `task_start` / `task_done` / `task_failed` events around each `pool.runEphemeral` call.
+2. Each worker gets a tiny custom tool (`defineTool({ name: 'report_status', ... })`) that writes a `task_status` event when called; the system prompt tells the worker to call it at every major step.
+
+Both kinds of event go into a per-run JSONL file. The companion [`agent-farm`](../../agent-farm/README.md) tool watches that file and renders a live dashboard — drop it in if you want a UI; skip it if the JSONL itself is enough. The [event format](../../agent-farm/EVENTS.md) is small and dependency-free.
+
+**Concrete instance — GitHub issues into git worktrees.** Specialise the four phases as: (A) `runAgent` over `gh issue list --json …` with a Zod schema picking solvable issues; (B) `git worktree add -b agent/issue-N /tmp/wt/issue-N HEAD` per item; (C) workers told to commit with `fix(#N): …` and never push; (D) driver pushes branches you accept after diff review, removes worktrees you reject (`git worktree remove --force …`). Same shape applies to URLs (sandbox = tmpdir), files (sandbox = copy), dataset rows (sandbox = a workspace per row).
 
 ### Recipe 2 — Map–reduce over a list with `runParallel` (fixed-name analysts → aggregator)
 

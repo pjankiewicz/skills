@@ -1,0 +1,27 @@
+{
+  "name": "agent-farm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Generic live dashboard for multi-agent runs. Watches a runs/ directory and renders any agent activity that follows the agent-farm event format. Pairs well with @jackchen_me/open-multi-agent.",
+  "bin": {
+    "agent-farm": "bin/agent-farm.js"
+  },
+  "scripts": {
+    "dev": "tsx src/server.ts",
+    "start": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "exports": {
+    ".": "./src/reporter.ts",
+    "./reporter": "./src/reporter.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

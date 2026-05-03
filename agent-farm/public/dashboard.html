@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>agent-farm</title>
+  <style>
+    :root {
+      --bg: #0d0f12;
+      --panel: #15181d;
+      --line: #1f242b;
+      --fg: #e3e6ea;
+      --dim: #8a93a3;
+      --dim2: #5d6573;
+      --accent: #80b8e6;
+      --ok: #5cd676;
+      --warn: #d6c66b;
+      --err: #e87286;
+      --running: #80b8e6;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+    }
+    header {
+      display: flex;
+      align-items: baseline;
+      gap: 24px;
+      padding: 16px 24px;
+      border-bottom: 1px solid var(--line);
+      flex-wrap: wrap;
+    }
+    h1 {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--dim);
+    }
+    select {
+      background: var(--panel);
+      color: var(--fg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font: inherit;
+    }
+    .stats { display: flex; gap: 24px; flex-wrap: wrap; margin-left: auto; }
+    .stat span { display: block; color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 2px; }
+    .stat strong { font-weight: 500; font-variant-numeric: tabular-nums; }
+    main { padding: 16px 24px; }
+    .meta-row {
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+      margin-bottom: 16px; color: var(--dim); font: 12px/1.4 ui-monospace, monospace;
+    }
+    .chip {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: var(--panel); border: 1px solid var(--line); border-radius: 99px;
+      padding: 3px 10px; font-size: 11px; color: var(--fg);
+    }
+    .chip span.k { color: var(--dim); }
+    table { width: 100%; border-collapse: collapse; }
+    th, td {
+      text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+    th { font-weight: 500; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--dim); }
+    td.id { font: 12px/1.4 ui-monospace, monospace; color: var(--accent); white-space: nowrap; }
+    td.title { max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    td.msg { color: var(--dim); max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    td.tokens, td.elapsed, td.last { font-variant-numeric: tabular-nums; color: var(--dim); }
+    td.meta-cell { font-size: 11px; }
+    td.meta-cell .chip { margin-right: 4px; margin-bottom: 2px; }
+    .phase {
+      display: inline-block; padding: 2px 10px; border-radius: 99px;
+      font-size: 11px; font-weight: 500; white-space: nowrap;
+    }
+    .phase-pending  { background: #1f242b; color: var(--dim); }
+    .phase-running  { background: #173045; color: var(--running); }
+    .phase-reading  { background: #173045; color: var(--running); }
+    .phase-editing  { background: #1d3326; color: var(--ok); }
+    .phase-testing  { background: #2c2916; color: var(--warn); }
+    .phase-committing { background: #2c2916; color: var(--warn); }
+    .phase-done     { background: #133b1f; color: var(--ok); }
+    .phase-blocked  { background: #371520; color: var(--err); }
+    .phase-failed   { background: #371520; color: var(--err); }
+    .empty { color: var(--dim2); padding: 32px 12px; text-align: center; }
+    code { font: 12px/1.4 ui-monospace, "SF Mono", monospace; }
+    a, a:visited { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .pulse { animation: pulse 1.4s ease-in-out infinite; }
+    @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.55 } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>agent-farm</h1>
+    <select id="runSelect" aria-label="Run"></select>
+    <div class="stats">
+      <div class="stat"><span>tasks</span><strong id="totalTasks">0</strong></div>
+      <div class="stat"><span>running</span><strong id="runningCount">0</strong></div>
+      <div class="stat"><span>done</span><strong id="doneCount">0</strong></div>
+      <div class="stat"><span>failed</span><strong id="failedCount">0</strong></div>
+      <div class="stat"><span>tokens</span><strong id="tokens">0&nbsp;/&nbsp;0</strong></div>
+      <div class="stat"><span>elapsed</span><strong id="elapsed">—</strong></div>
+    </div>
+  </header>
+  <main>
+    <div id="metaRow" class="meta-row"></div>
+    <table>
+      <thead>
+        <tr>
+          <th style="width: 14ch">Task</th>
+          <th>Title</th>
+          <th>Phase</th>
+          <th style="width: 10ch">Last</th>
+          <th>Msg</th>
+          <th style="width: 12ch">Tokens (in/out)</th>
+          <th style="width: 8ch">Elapsed</th>
+          <th>Metadata</th>
+        </tr>
+      </thead>
+      <tbody id="rows">
+        <tr><td colspan="8" class="empty">Waiting for runs in <code id="runsDir">…</code></td></tr>
+      </thead>
+    </table>
+  </main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const RUNNING_PHASES = new Set(['running','reading','editing','testing','committing']);
+const POLL_MS = 1000;
+
+let knownRuns = [];
+let activeRunId = null;
+let userPicked = false;
+let runsDir = '';
+
+function escape(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function formatDur(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '—';
+  if (ms < 1000) return ms + 'ms';
+  const s = Math.round(ms / 1000);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  const ss = s % 60;
+  return m + 'm' + ss.toString().padStart(2, '0') + 's';
+}
+
+function metadataChips(metadata) {
+  if (!metadata || typeof metadata !== 'object') return '';
+  return Object.entries(metadata)
+    .filter(([, v]) => v !== null && v !== undefined && v !== '')
+    .map(([k, v]) => '<span class="chip"><span class="k">' + escape(k) + '</span>' + escape(typeof v === 'object' ? JSON.stringify(v) : v) + '</span>')
+    .join('');
+}
+
+async function fetchRuns() {
+  try {
+    const res = await fetch('/api/runs', { cache: 'no-store' });
+    if (!res.ok) return;
+    const data = await res.json();
+    knownRuns = data.runs ?? [];
+    runsDir = data.dir ?? '';
+    $('runsDir').textContent = runsDir || '(unset)';
+    const sel = $('runSelect');
+    const desired = activeRunId ?? (knownRuns[0]?.runId ?? null);
+    const opts = knownRuns.map(r => '<option value="' + escape(r.runId) + '">' + escape(r.runId) + '</option>').join('');
+    sel.innerHTML = opts || '<option value="">—</option>';
+    if (desired) sel.value = desired;
+    if (!userPicked && knownRuns[0]) activeRunId = knownRuns[0].runId;
+  } catch {}
+}
+
+async function fetchRunMeta(runId) {
+  try {
+    const res = await fetch('/runs/' + encodeURIComponent(runId) + '/meta.json', { cache: 'no-store' });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
+}
+
+async function fetchEvents(runId) {
+  try {
+    const res = await fetch('/runs/' + encodeURIComponent(runId) + '/events.jsonl', { cache: 'no-store' });
+    if (!res.ok) return [];
+    const text = await res.text();
+    return text.trim().split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
+
+function aggregate(events) {
+  const tasks = new Map();
+  let runStart = null, runDone = null;
+  let totalIn = 0, totalOut = 0;
+  for (const ev of events) {
+    if (typeof ev.ts !== 'number') continue;
+    if (ev.tokens) {
+      totalIn += ev.tokens.input ?? 0;
+      totalOut += ev.tokens.output ?? 0;
+    }
+    if (ev.type === 'run_start') runStart = ev.ts;
+    if (ev.type === 'run_done') runDone = ev.ts;
+    if (!ev.taskId) continue;
+    let t = tasks.get(ev.taskId);
+    if (!t) {
+      t = {
+        taskId: ev.taskId,
+        title: '',
+        phase: 'pending',
+        msg: '',
+        startTs: ev.ts,
+        lastTs: ev.ts,
+        tokensIn: 0,
+        tokensOut: 0,
+        metadata: {},
+      };
+      tasks.set(ev.taskId, t);
+    }
+    t.lastTs = ev.ts;
+    if (ev.title) t.title = ev.title;
+    if (ev.metadata) t.metadata = { ...t.metadata, ...ev.metadata };
+    if (ev.msg) t.msg = ev.msg;
+    if (ev.tokens) {
+      t.tokensIn = ev.tokens.input ?? t.tokensIn;
+      t.tokensOut = ev.tokens.output ?? t.tokensOut;
+    }
+    switch (ev.type) {
+      case 'task_start':  t.phase = 'running'; t.startTs = ev.ts; break;
+      case 'task_status': if (ev.phase) t.phase = ev.phase; break;
+      case 'task_done':   t.phase = 'done'; break;
+      case 'task_failed': t.phase = 'failed'; break;
+    }
+  }
+  return { tasks: [...tasks.values()].sort((a, b) => String(a.taskId).localeCompare(String(b.taskId), undefined, { numeric: true })), runStart, runDone, totalIn, totalOut };
+}
+
+function renderMeta(meta) {
+  if (!meta) { $('metaRow').innerHTML = ''; return; }
+  $('metaRow').innerHTML = Object.entries(meta).map(([k, v]) => {
+    const val = typeof v === 'object' ? JSON.stringify(v) : v;
+    return '<span class="chip"><span class="k">' + escape(k) + '</span>' + escape(val) + '</span>';
+  }).join('');
+}
+
+function render(agg, meta) {
+  const { tasks, runStart, runDone, totalIn, totalOut } = agg;
+  $('totalTasks').textContent = tasks.length;
+  let running = 0, done = 0, failed = 0;
+  for (const t of tasks) {
+    if (RUNNING_PHASES.has(t.phase)) running++;
+    else if (t.phase === 'done') done++;
+    else if (t.phase === 'failed') failed++;
+  }
+  $('runningCount').textContent = running;
+  $('doneCount').textContent = done;
+  $('failedCount').textContent = failed;
+  $('tokens').textContent = totalIn.toLocaleString() + ' / ' + totalOut.toLocaleString();
+  if (runStart) {
+    const end = runDone ?? Date.now();
+    $('elapsed').textContent = formatDur(end - runStart) + (runDone ? '' : ' …');
+    $('elapsed').classList.toggle('pulse', !runDone);
+  } else {
+    $('elapsed').textContent = '—';
+    $('elapsed').classList.remove('pulse');
+  }
+
+  renderMeta(meta);
+
+  if (tasks.length === 0) {
+    $('rows').innerHTML = '<tr><td colspan="8" class="empty">No tasks yet — waiting for events.</td></tr>';
+    return;
+  }
+  $('rows').innerHTML = tasks.map(t => {
+    return '<tr>'
+      + '<td class="id">' + escape(t.taskId) + '</td>'
+      + '<td class="title" title="' + escape(t.title) + '">' + escape(t.title || '') + '</td>'
+      + '<td><span class="phase phase-' + escape(t.phase) + '">' + escape(t.phase) + '</span></td>'
+      + '<td class="last">' + new Date(t.lastTs).toLocaleTimeString() + '</td>'
+      + '<td class="msg" title="' + escape(t.msg) + '">' + escape(t.msg) + '</td>'
+      + '<td class="tokens">' + t.tokensIn.toLocaleString() + ' / ' + t.tokensOut.toLocaleString() + '</td>'
+      + '<td class="elapsed">' + formatDur(t.lastTs - t.startTs) + '</td>'
+      + '<td class="meta-cell">' + metadataChips(t.metadata) + '</td>'
+      + '</tr>';
+  }).join('');
+}
+
+async function tick() {
+  await fetchRuns();
+  if (!activeRunId) return;
+  const [events, meta] = await Promise.all([fetchEvents(activeRunId), fetchRunMeta(activeRunId)]);
+  render(aggregate(events), meta);
+}
+
+$('runSelect').addEventListener('change', (e) => {
+  userPicked = true;
+  activeRunId = e.target.value || null;
+  tick();
+});
+
+setInterval(tick, POLL_MS);
+tick();
+</script>
+</body>
+</html>
