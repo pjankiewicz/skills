@@ -68,20 +68,31 @@ import type { AgentConfig } from '@jackchen_me/open-multi-agent'
 
 // C) Build one ephemeral Agent per item and fan out under a concurrency cap.
 function buildWorker(item: Item): Agent {
+  const reg = new ToolRegistry()
+  registerBuiltInTools(reg)
+  // Custom tools must be registered HERE on the registry — `customTools` on AgentConfig is
+  // only honoured by the orchestrator's run-paths (runAgent/runTeam/runTasks). Hand-built
+  // Agents fed to runEphemeral silently drop it. (See pitfalls below.)
+  reg.register(buildReportStatusTool(item.id), { runtimeAdded: true })
+
   const cfg: AgentConfig = {
     name: `worker-${item.id}`,        // unique per item; ephemeral, not pool-registered
     model: MODEL, ...PROVIDER,
     systemPrompt:
       `Work ONLY inside ${item.sandbox}. Pass cwd=${item.sandbox} on every bash call. ` +
-      `Make the smallest change that resolves the task. Commit when done; do not push.`,
+      `Make the smallest change. Commit when done; do not push. ` +
+      // Cheap, decisive prohibition — without it weak models will eagerly run
+      // cargo/npm/pytest from inside a fresh worktree and recompile everything from zero.
+      `Do NOT run heavy builds (\`cargo build/test\`, \`npm install\`, \`pytest\` over big trees) ` +
+      `unless the task explicitly requires compiled-code verification.`,
     tools: ['bash', 'file_read', 'file_write', 'file_edit', 'grep', 'glob'],
     maxTurns: 30,
+    maxTokens: 4096,                                          // per-call cap; backstop against in-turn token babble
     timeoutMs: 10 * 60_000,
     maxTokenBudget: 200_000,
     loopDetection: { maxRepetitions: 4, onLoopDetected: 'terminate' },
     compressToolResults: { minChars: 800 },
   }
-  const reg = new ToolRegistry(); registerBuiltInTools(reg)
   return new Agent(cfg, reg, new ToolExecutor(reg))
 }
 
@@ -101,14 +112,37 @@ const settled = await Promise.allSettled(
 - **Workers are ephemeral.** A fresh `Agent` instance per item, run via `runEphemeral`. They aren't registered, can have unique names without collision, and `runEphemeral` skips the per-agent mutex that `run`/`runParallel` would impose.
 - **Sandboxing inside the worker is a systemPrompt + bash-arg pattern.** OMA has no per-agent `cwd` field. Bake the absolute path into the systemPrompt and instruct the agent to pass `cwd` on every bash call. The `bash` tool reads `cwd` from the LLM's tool-call arguments.
 - **`Promise.allSettled` is intentional.** Independent items must fail independently.
-- **The four production knobs every worker needs:** `timeoutMs`, `maxTokenBudget`, `loopDetection`, `compressToolResults`. Without these, one misread item can burn the batch's wall clock or token budget.
+- **Five production knobs every worker needs:** `timeoutMs` (wall clock), `maxTokenBudget` (cumulative), `maxTokens` (per call — the backstop against in-turn token babble), `loopDetection` (across-turn repetition), and `compressToolResults` (don't re-feed every read into every turn). Without all five, one misread item can burn wall clock, token budget, or both.
+- **Forbid heavy builds in the systemPrompt.** Weak models (gemma 31B, qwen 30B) will eagerly run `cargo test` / `npm install` / `pytest` to "verify" a one-line text change, and a fresh worktree has no shared build cache so they compile your whole project from zero. Either tell them not to (cheap), or set `CARGO_TARGET_DIR=<main-checkout>/target` (or the equivalent) so all worktrees share artefacts (also cheap, more permissive).
+- **A worker's `result.success === true` does NOT mean the change is correct.** It means the model ended its turn cleanly. Always capture `result.output` so you can see *why* it stopped — "blocked", "fix already in HEAD", "I assumed it was fine because the test crashed". Without this, runs are opaque.
+- **A worker may stop with the worktree dirty but uncommitted.** It hit `maxTurns` mid-flow, or got distracted into a build that crashed. The driver should fall back: after the worker stops, if `git -C ${path} status --porcelain` is non-empty, commit deterministically (`fix(<id>): WIP — worker did not commit`) so the diff isn't lost.
 
 **Live observability — optional sidekick.** Mid-run progress isn't surfaced by OMA's `onProgress`/`onTrace` for ephemeral runs (those wire up at the orchestrator level). The pattern that works:
 
 1. Driver emits `task_start` / `task_done` / `task_failed` events around each `pool.runEphemeral` call.
-2. Each worker gets a tiny custom tool (`defineTool({ name: 'report_status', ... })`) that writes a `task_status` event when called; the system prompt tells the worker to call it at every major step.
+2. Each worker gets a tiny custom tool that writes a `task_status` event when called. The system prompt instructs the worker to call it before each major step.
+
+```ts
+// `reporter` is an agent-farm Reporter (or any equivalent JSONL appender)
+function buildReportStatusTool(taskId: string) {
+  return defineTool({
+    name: 'report_status',
+    description: 'Report progress so the dashboard can show what you are doing. Call before each major step.',
+    inputSchema: z.object({
+      phase: z.enum(['reading', 'editing', 'testing', 'committing', 'done', 'blocked']),
+      msg: z.string(),
+    }),
+    execute: async ({ phase, msg }) => {
+      reporter.taskStatus({ taskId, phase, msg })
+      return { data: 'noted' }
+    },
+  })
+}
+```
 
 Both kinds of event go into a per-run JSONL file. The companion [`agent-farm`](../../agent-farm/README.md) tool watches that file and renders a live dashboard — drop it in if you want a UI; skip it if the JSONL itself is enough. The [event format](../../agent-farm/EVENTS.md) is small and dependency-free.
+
+**Verified end-to-end with `google/gemma-4-31b-it` on OpenRouter.** Triage produces clean Zod-validated output reliably; workers do call `report_status` once it's actually registered on the registry (the trap above). The same model also exhibits the in-turn token-babble failure mode and the "recompile-the-world to verify a typo" failure mode — both of which the production knobs above defend against.
 
 **Concrete instance — GitHub issues into git worktrees.** Specialise the four phases as: (A) `runAgent` over `gh issue list --json …` with a Zod schema picking solvable issues; (B) `git worktree add -b agent/issue-N /tmp/wt/issue-N HEAD` per item; (C) workers told to commit with `fix(#N): …` and never push; (D) driver pushes branches you accept after diff review, removes worktrees you reject (`git worktree remove --force …`). Same shape applies to URLs (sandbox = tmpdir), files (sandbox = copy), dataset rows (sandbox = a workspace per row).
 
@@ -341,6 +375,14 @@ After `npm install`, the package exposes the `oma` binary (or `node dist/cli/oma
 - **Small gemmas (≤4B) struggle with tool calls.** Use `gemma3:12b` or larger when the worker needs `bash`/`file_*`. For tighter models, prefer pure structured output (no tools) for triage/extraction passes; do the side effects deterministically afterward.
 - **Worker timeouts are per agent, not per pool.** `AgentPool` itself has no timeout. Set `timeoutMs` on each `AgentConfig` and combine with `maxTokenBudget` and `loopDetection` so a single stuck worker can't burn the batch's wall-clock or token budget.
 - **`runEphemeral` is not registered.** The `Agent` is built fresh, runs once, and is discarded. It does not appear in `pool.list()` / `pool.getStatus()` and cannot be re-targeted by name. That's the point — if you need the same worker for a follow-up turn, use `pool.run` with a registered agent.
+- **`AgentConfig.customTools` is silently dropped on the `runEphemeral` path.** It's read only by the orchestrator's internal `buildAgent()` (used by `runAgent`/`runTeam`/`runTasks`). When you hand-build an `Agent` for `runEphemeral`, you must register custom tools on the `ToolRegistry` yourself: `reg.register(myTool, { runtimeAdded: true })`. If you set `customTools` on the config and skip the registry call, the tool simply doesn't exist for the worker — and the model never calls it, no error.
+- **In-turn token babble isn't caught by `loopDetection`.** That detector compares full turns. A single assistant turn that emits `<|channel>thought a a a a a …` for thousands of tokens (a real failure mode for gemma-4 31B and other quantised builds under context pressure) will run all the way to `maxTokenBudget` unless you also set a per-call `maxTokens` cap. A 4096-token cap is cheap and decisive.
+- **Workers will recompile your whole project to "verify" a trivial change.** Observed in production: gemma 31B asked to fix a markdown typo ran `cargo test` from inside a fresh worktree, recompiled fitnessgrid from scratch into a per-worktree `target/` (4.9 GB), then crashed with ENOSPC and burned its remaining turns trying to recover — never committing the actual fix. The fixes:
+  1. Forbid heavy builds in the systemPrompt unless the change requires compiled verification, OR
+  2. Inject `env: { CARGO_TARGET_DIR: '${repo}/target' }` (or equivalent) so all worktrees share build artefacts.
+- **Worker can stop without committing.** Hitting `maxTurns` after a tool failure leaves the worktree dirty but un-committed; the worker reports "success" (the run ended cleanly) and the diff would be lost without a fallback. Add a deterministic post-run check: `git status --porcelain` non-empty → commit with `fix(<id>): WIP — worker did not commit`. Same idea for any sandbox where the worker's edits should be preserved.
+- **Capture `result.output` in every emitted event.** `success: true, output: ''` happens, and so does `success: true, output: '<|channel>thought a a a a …'`. Without the final text in your event log, "stopped" and "stopped with garbage" look identical in the dashboard.
+- **`git worktree` provisioning needs a prune step.** If a previous run had its worktree dirs deleted with `rm -rf` (or any non-`git worktree remove` cleanup), git keeps the metadata in `.git/worktrees/`. Subsequent `git worktree add -b` calls fail with "branch already exists" or "fatal: '<path>' already registered". Always run `git worktree prune` before the provisioning loop.
 
 ## When the user asks "what about X?"
 
