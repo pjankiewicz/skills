@@ -87,11 +87,15 @@ function buildWorker(item: Item): Agent {
       `unless the task explicitly requires compiled-code verification.`,
     tools: ['bash', 'file_read', 'file_write', 'file_edit', 'grep', 'glob'],
     maxTurns: 30,
-    maxTokens: 4096,                                          // per-call cap; backstop against in-turn token babble
+    maxTokens: 4096,                       // per-call cap; bounds in-turn token babble
     timeoutMs: 10 * 60_000,
     maxTokenBudget: 200_000,
     loopDetection: { maxRepetitions: 4, onLoopDetected: 'terminate' },
     compressToolResults: { minChars: 800 },
+    // Weak-model defences (OpenAI-track; Anthropic ignores). Empirically eliminate `<|channel>thought a a a` babble on gemma-4-31b.
+    temperature: 0.05,
+    frequencyPenalty: 0.6,
+    presencePenalty: 0.4,
   }
   return new Agent(cfg, reg, new ToolExecutor(reg))
 }
@@ -383,6 +387,9 @@ After `npm install`, the package exposes the `oma` binary (or `node dist/cli/oma
 - **Worker can stop without committing.** Hitting `maxTurns` after a tool failure leaves the worktree dirty but un-committed; the worker reports "success" (the run ended cleanly) and the diff would be lost without a fallback. Add a deterministic post-run check: `git status --porcelain` non-empty → commit with `fix(<id>): WIP — worker did not commit`. Same idea for any sandbox where the worker's edits should be preserved.
 - **Capture `result.output` in every emitted event.** `success: true, output: ''` happens, and so does `success: true, output: '<|channel>thought a a a a …'`. Without the final text in your event log, "stopped" and "stopped with garbage" look identical in the dashboard.
 - **`git worktree` provisioning needs a prune step.** If a previous run had its worktree dirs deleted with `rm -rf` (or any non-`git worktree remove` cleanup), git keeps the metadata in `.git/worktrees/`. Subsequent `git worktree add -b` calls fail with "branch already exists" or "fatal: '<path>' already registered". Always run `git worktree prune` before the provisioning loop.
+- **Pre-filter inputs by reachable git history when triaging GitHub issues.** GitHub's `state: open` lags merged code — issues stay open after the fix lands until someone closes them. Without a filter, triage will pick already-fixed work and workers waste turns reconfirming "fix already in HEAD" then loop until `maxTurns`. Drop any issue whose number appears in `git log --grep="(#N)|fix(#N)|Closes #N|Fixes #N"`. Same idea generalises: filter URLs by what's already in your DB, files by what's already processed, etc. Saves a triage round + a worker run per phantom item.
+- **Weak-model in-turn token babble survives `maxTokens` caps.** Per-call `maxTokens: 4096` bounds damage but doesn't prevent the failure mode. What does, on `google/gemma-4-31b-it`: `temperature: 0.05`, `frequencyPenalty: 0.6`, `presencePenalty: 0.4`. The penalties target the literal `a a a a` repetition in the babble; low temperature avoids straying into the attractor in the first place. All three are OpenAI-track fields, forwarded by OpenRouter and the OpenAI cloud / OpenAI-compatible local servers; the Anthropic adapter ignores them.
+- **Long, structured system prompts can hurt weak models.** Observed: a 30-line prompt with explicit BUILD POLICY / WORKFLOW / FALLBACK blocks correlated with one worker silently no-op'ing (zero tool calls, no final text) on `gemma-4-31b`. The same task with a 12-line condensed prompt completed cleanly. With weak models, prefer the smallest prompt that conveys the rules. Verbose stronger-model prompts are not portable downward.
 
 ## When the user asks "what about X?"
 
