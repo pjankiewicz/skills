@@ -81,21 +81,21 @@ function buildWorker(item: Item): Agent {
     systemPrompt:
       `Work ONLY inside ${item.sandbox}. Pass cwd=${item.sandbox} on every bash call. ` +
       `Make the smallest change. Commit when done; do not push. ` +
-      // Cheap, decisive prohibition — without it weak models will eagerly run
-      // cargo/npm/pytest from inside a fresh worktree and recompile everything from zero.
+      // Cheap, decisive prohibition — workers will eagerly run cargo/npm/pytest from inside a
+      // fresh worktree and recompile everything from zero unless told not to.
       `Do NOT run heavy builds (\`cargo build/test\`, \`npm install\`, \`pytest\` over big trees) ` +
       `unless the task explicitly requires compiled-code verification.`,
     tools: ['bash', 'file_read', 'file_write', 'file_edit', 'grep', 'glob'],
     maxTurns: 30,
-    maxTokens: 4096,                       // per-call cap; bounds in-turn token babble
+    maxTokens: 4096,                       // per-call cap; sane backstop on output length
     timeoutMs: 10 * 60_000,
     maxTokenBudget: 200_000,
     loopDetection: { maxRepetitions: 4, onLoopDetected: 'terminate' },
     compressToolResults: { minChars: 800 },
-    // Weak-model defences (OpenAI-track; Anthropic ignores). Empirically eliminate `<|channel>thought a a a` babble on gemma-4-31b.
-    temperature: 0.05,
-    frequencyPenalty: 0.6,
-    presencePenalty: 0.4,
+    // OpenRouter routes one slug to multiple upstream providers with very different quants.
+    // Pin to bf16/fp16 — fp4 (Chutes) and fp8 endpoints can corrupt rare tokens and produce
+    // template-leak + repetition runs that look like model failure but are quantisation noise.
+    extraBody: { provider: { quantizations: ['bf16', 'fp16'], allow_fallbacks: true } },
   }
   return new Agent(cfg, reg, new ToolExecutor(reg))
 }
@@ -116,7 +116,7 @@ const settled = await Promise.allSettled(
 - **Workers are ephemeral.** A fresh `Agent` instance per item, run via `runEphemeral`. They aren't registered, can have unique names without collision, and `runEphemeral` skips the per-agent mutex that `run`/`runParallel` would impose.
 - **Sandboxing inside the worker is a systemPrompt + bash-arg pattern.** OMA has no per-agent `cwd` field. Bake the absolute path into the systemPrompt and instruct the agent to pass `cwd` on every bash call. The `bash` tool reads `cwd` from the LLM's tool-call arguments.
 - **`Promise.allSettled` is intentional.** Independent items must fail independently.
-- **Five production knobs every worker needs:** `timeoutMs` (wall clock), `maxTokenBudget` (cumulative), `maxTokens` (per call — the backstop against in-turn token babble), `loopDetection` (across-turn repetition), and `compressToolResults` (don't re-feed every read into every turn). Without all five, one misread item can burn wall clock, token budget, or both.
+- **Five production knobs every worker needs:** `timeoutMs` (wall clock), `maxTokenBudget` (cumulative), `maxTokens` (per call — sane output cap), `loopDetection` (across-turn repetition), and `compressToolResults` (don't re-feed every read into every turn). Without all five, one misread item can burn wall clock, token budget, or both.
 - **Forbid heavy builds in the systemPrompt.** Weak models (gemma 31B, qwen 30B) will eagerly run `cargo test` / `npm install` / `pytest` to "verify" a one-line text change, and a fresh worktree has no shared build cache so they compile your whole project from zero. Either tell them not to (cheap), or set `CARGO_TARGET_DIR=<main-checkout>/target` (or the equivalent) so all worktrees share artefacts (also cheap, more permissive).
 - **A worker's `result.success === true` does NOT mean the change is correct.** It means the model ended its turn cleanly. Always capture `result.output` so you can see *why* it stopped — "blocked", "fix already in HEAD", "I assumed it was fine because the test crashed". Without this, runs are opaque.
 - **A worker may stop with the worktree dirty but uncommitted.** It hit `maxTurns` mid-flow, or got distracted into a build that crashed. The driver should fall back: after the worker stops, if `git -C ${path} status --porcelain` is non-empty, commit deterministically (`fix(<id>): WIP — worker did not commit`) so the diff isn't lost.
@@ -146,7 +146,7 @@ function buildReportStatusTool(taskId: string) {
 
 Both kinds of event go into a per-run JSONL file. The companion [`agent-farm`](../../agent-farm/README.md) tool watches that file and renders a live dashboard — drop it in if you want a UI; skip it if the JSONL itself is enough. The [event format](../../agent-farm/EVENTS.md) is small and dependency-free.
 
-**Verified end-to-end with `google/gemma-4-31b-it` on OpenRouter.** Triage produces clean Zod-validated output reliably; workers do call `report_status` once it's actually registered on the registry (the trap above). The same model also exhibits the in-turn token-babble failure mode and the "recompile-the-world to verify a typo" failure mode — both of which the production knobs above defend against.
+**Verified end-to-end with `google/gemma-4-31b-it` on OpenRouter.** Six runs against fitnessgrid open issues. Triage produces clean Zod-validated output reliably; workers call `report_status` correctly once it's registered on the registry (the trap above); a clean, scoped one-line commit lands when `extraBody.provider.quantizations` is pinned to bf16, the build prohibition is in the systemPrompt, and the input list is pre-filtered against git history. The "recompile-the-world to verify a typo" failure and the apparent "model goes incoherent" failure both have concrete fixes above; neither is inherent to gemma-4 31B.
 
 **Concrete instance — GitHub issues into git worktrees.** Specialise the four phases as: (A) `runAgent` over `gh issue list --json …` with a Zod schema picking solvable issues; (B) `git worktree add -b agent/issue-N /tmp/wt/issue-N HEAD` per item; (C) workers told to commit with `fix(#N): …` and never push; (D) driver pushes branches you accept after diff review, removes worktrees you reject (`git worktree remove --force …`). Same shape applies to URLs (sandbox = tmpdir), files (sandbox = copy), dataset rows (sandbox = a workspace per row).
 
@@ -380,7 +380,7 @@ After `npm install`, the package exposes the `oma` binary (or `node dist/cli/oma
 - **Worker timeouts are per agent, not per pool.** `AgentPool` itself has no timeout. Set `timeoutMs` on each `AgentConfig` and combine with `maxTokenBudget` and `loopDetection` so a single stuck worker can't burn the batch's wall-clock or token budget.
 - **`runEphemeral` is not registered.** The `Agent` is built fresh, runs once, and is discarded. It does not appear in `pool.list()` / `pool.getStatus()` and cannot be re-targeted by name. That's the point — if you need the same worker for a follow-up turn, use `pool.run` with a registered agent.
 - **`AgentConfig.customTools` is silently dropped on the `runEphemeral` path.** It's read only by the orchestrator's internal `buildAgent()` (used by `runAgent`/`runTeam`/`runTasks`). When you hand-build an `Agent` for `runEphemeral`, you must register custom tools on the `ToolRegistry` yourself: `reg.register(myTool, { runtimeAdded: true })`. If you set `customTools` on the config and skip the registry call, the tool simply doesn't exist for the worker — and the model never calls it, no error.
-- **In-turn token babble isn't caught by `loopDetection`.** That detector compares full turns. A single assistant turn that emits `<|channel>thought a a a a a …` for thousands of tokens (a real failure mode for gemma-4 31B and other quantised builds under context pressure) will run all the way to `maxTokenBudget` unless you also set a per-call `maxTokens` cap. A 4096-token cap is cheap and decisive.
+- **In-turn token babble isn't caught by `loopDetection`.** That detector compares full turns. A single assistant turn that emits a stuck repetition run (e.g. `<|channel>thought a a a a a …`) for thousands of tokens is bounded only by the per-call `maxTokens`. A 4096-token cap is cheap and sensible regardless. The babble itself is usually a *quantisation* artifact at the inference server (see the OpenRouter routing pitfall below) rather than the model — fix it upstream, not by punishing sampling.
 - **Workers will recompile your whole project to "verify" a trivial change.** Observed in production: gemma 31B asked to fix a markdown typo ran `cargo test` from inside a fresh worktree, recompiled fitnessgrid from scratch into a per-worktree `target/` (4.9 GB), then crashed with ENOSPC and burned its remaining turns trying to recover — never committing the actual fix. The fixes:
   1. Forbid heavy builds in the systemPrompt unless the change requires compiled verification, OR
   2. Inject `env: { CARGO_TARGET_DIR: '${repo}/target' }` (or equivalent) so all worktrees share build artefacts.
@@ -388,8 +388,7 @@ After `npm install`, the package exposes the `oma` binary (or `node dist/cli/oma
 - **Capture `result.output` in every emitted event.** `success: true, output: ''` happens, and so does `success: true, output: '<|channel>thought a a a a …'`. Without the final text in your event log, "stopped" and "stopped with garbage" look identical in the dashboard.
 - **`git worktree` provisioning needs a prune step.** If a previous run had its worktree dirs deleted with `rm -rf` (or any non-`git worktree remove` cleanup), git keeps the metadata in `.git/worktrees/`. Subsequent `git worktree add -b` calls fail with "branch already exists" or "fatal: '<path>' already registered". Always run `git worktree prune` before the provisioning loop.
 - **Pre-filter inputs by reachable git history when triaging GitHub issues.** GitHub's `state: open` lags merged code — issues stay open after the fix lands until someone closes them. Without a filter, triage will pick already-fixed work and workers waste turns reconfirming "fix already in HEAD" then loop until `maxTurns`. Drop any issue whose number appears in `git log --grep="(#N)|fix(#N)|Closes #N|Fixes #N"`. Same idea generalises: filter URLs by what's already in your DB, files by what's already processed, etc. Saves a triage round + a worker run per phantom item.
-- **Weak-model in-turn token babble survives `maxTokens` caps.** Per-call `maxTokens: 4096` bounds damage but doesn't prevent the failure mode. What does, on `google/gemma-4-31b-it`: `temperature: 0.05`, `frequencyPenalty: 0.6`, `presencePenalty: 0.4`. The penalties target the literal `a a a a` repetition in the babble; low temperature avoids straying into the attractor in the first place. All three are OpenAI-track fields, forwarded by OpenRouter and the OpenAI cloud / OpenAI-compatible local servers; the Anthropic adapter ignores them.
-- **Long, structured system prompts can hurt weak models.** Observed: a 30-line prompt with explicit BUILD POLICY / WORKFLOW / FALLBACK blocks correlated with one worker silently no-op'ing (zero tool calls, no final text) on `gemma-4-31b`. The same task with a 12-line condensed prompt completed cleanly. With weak models, prefer the smallest prompt that conveys the rules. Verbose stronger-model prompts are not portable downward.
+- **OpenRouter routes one slug to multiple upstream providers with wildly different quantisations.** A single `model` string like `google/gemma-4-31b-it` may resolve to bf16 (Novita / Parasail / Venice), fp8 (DeepInfra), or **fp4 (Chutes)** — all at similar prices. fp4 inference can corrupt rare tokens (chat-template control tokens and tool-call markers) and produce **template-leak garbage plus token repetition runs that look like the model is "broken"** but are entirely quantisation noise. The same prompt to the same slug behaves differently on different runs depending on which upstream OpenRouter happens to load-balance to. **Always pin quantisation in production**: pass `extraBody: { provider: { quantizations: ['bf16', 'fp16'] } }` (OMA forwards `extraBody` into the request body; OpenRouter reads `provider.quantizations`). Add `ignore: ['Chutes']` if you want belt-and-suspenders. This is empirical — the same task that produced `<|channel>thought a a a a a` on gemma-4-31b on default routing produced a clean, surgical commit with bf16 pinned and no other changes.
 
 ## When the user asks "what about X?"
 
