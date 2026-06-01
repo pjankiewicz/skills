@@ -20,6 +20,22 @@ npx skills add pjankiewicz/skills
 
 Browse the directory at [skills.sh](https://skills.sh).
 
+### `ux-review`
+
+A per-screen, PASS/FAIL heuristic rubric (~55 criteria across 9 sections) for auditing the **interaction quality** of a mobile (iOS/Android) or web UI — pressed/focus/disabled states, empty/loading/error states, touch targets, platform conventions (Apple HIG / Material 3), WCAG 2.2 AA contrast, system-status feedback, and honest copy. Hunts *works-but-feels-wrong*.
+
+```bash
+npx skills add pjankiewicz/skills@ux-review
+```
+
+### `app-bug-sweep`
+
+A fan-out methodology for finding the defects that *ship* — the integration gaps a compiler and unit tests never catch: dead/no-op controls, capability built on the backend but never wired to a screen, inert gestures, silent data-loss footguns, and dead settings / fake data / cross-platform decode-parity gaps. Runs as parallel read-only scans, one per failure class, with a suppression list so each reports only net-new findings. Pairs with `ux-review` (one hunts *broken*, the other *feels-wrong*).
+
+```bash
+npx skills add pjankiewicz/skills@app-bug-sweep
+```
+
 ## What the open-multi-agent skill covers
 
 - **Three run modes** — `runAgent` (single), `runTeam` (goal-driven coordinator), `runTasks` (explicit DAG).
