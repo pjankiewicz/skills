@@ -36,6 +36,22 @@ A fan-out methodology for finding the defects that *ship* — the integration ga
 npx skills add pjankiewicz/skills@app-bug-sweep
 ```
 
+### `one-item-per-file`
+
+A code-as-data authoring methodology for any non-trivial module: write it in three phases — (1) define the data structures, (2) define the function signatures so the skeleton compiles, (3) implement the functions — with strict **one item per file** (every type and every free function in its own file; a module is a directory of them). Isolated items parallelize cleanly and related ones batch; compile gates between phases catch a mistake where it was made. Makes code precise to write, parallelize, and maintain.
+
+```bash
+npx skills add pjankiewicz/skills@one-item-per-file
+```
+
+### `faithful-port`
+
+Porting/translating code from a cited reference (C++ → Rust, GLSL → WGSL, one engine's algorithm into yours) where faithfulness is the goal. Builds on `one-item-per-file` and adds reference fidelity: transcribe each reference function **1:1** into its own file (never paraphrase or consolidate — that silently drops branches and edge-cases), resolve needed types/functions against the existing codebase (reuse vs declare-missing), batch implementations by how functions are **collocated in the reference** (the speed/cost↔coherence dial), and verify each item against the reference with an **independent oracle** — not a self-check, and not an aggregate metric that hides a localized defect.
+
+```bash
+npx skills add pjankiewicz/skills@faithful-port
+```
+
 ## What the open-multi-agent skill covers
 
 - **Three run modes** — `runAgent` (single), `runTeam` (goal-driven coordinator), `runTasks` (explicit DAG).
