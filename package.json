@@ -1,0 +1,13 @@
+{
+  "name": "pjankiewicz-skills",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Agent Skills repo — tooling/CI only; the skills themselves run no code.",
+  "scripts": {
+    "validate": "node scripts/validate-skills.mjs"
+  },
+  "devDependencies": {
+    "gray-matter": "^4.0.3"
+  }
+}

@@ -1,0 +1,29 @@
+name: validate-skills
+
+# Guard every push/PR: each skills/<name>/SKILL.md must have frontmatter that parses with the same
+# parser the `npx skills` installer uses, with a valid name + description. Catches the silent-skip
+# bug where an unquoted `description:` containing a `: ` (colon-space) fails YAML parsing.
+
+on:
+  push:
+    paths:
+      - 'skills/**'
+      - 'scripts/validate-skills.mjs'
+      - 'package.json'
+      - '.github/workflows/validate-skills.yml'
+  pull_request:
+    paths:
+      - 'skills/**'
+      - 'scripts/validate-skills.mjs'
+      - 'package.json'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install --no-audit --no-fund
+      - run: npm run validate
